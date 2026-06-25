@@ -1,0 +1,17 @@
+LEGALIZE — España: legislation as open data
+
+SOFTWARE / PIPELINE
+The software that generates and maintains this repository is open source
+under the MIT License:
+  https://github.com/legalize-dev/legalize-pipeline
+
+LEGISLATIVE CONTENT (DATA)
+Condiciones de reutilización del BOE — cita obligatoria de la fuente
+These are official public-sector texts reproduced from their official
+source. The original source of each document is recorded in the `source`
+field of that file's YAML front matter.
+
+DISCLAIMER
+Automated reproduction of official sources. This is not an official or
+verified legal text. Always consult the official source for authoritative
+versions.
