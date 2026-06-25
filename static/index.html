@@ -234,7 +234,24 @@
       font-size: .92rem;
       line-height: 1.65;
       color: var(--text);
-      white-space: pre-wrap;
+    }
+    #ai-answer p { margin: 0 0 .7em; }
+    #ai-answer p:last-child { margin-bottom: 0; }
+    #ai-answer ul, #ai-answer ol { margin: .3em 0 .8em; padding-left: 1.4em; }
+    #ai-answer li { margin: .2em 0; }
+    #ai-answer .ai-h {
+      font-size: .9rem;
+      font-weight: 700;
+      color: var(--accent);
+      margin: 1em 0 .35em;
+    }
+    #ai-answer strong { font-weight: 700; color: var(--text); }
+    #ai-answer code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: .85em;
+      background: rgba(0,0,0,.06);
+      padding: .08em .35em;
+      border-radius: 4px;
     }
     .ai-loading {
       display: flex;
@@ -1012,9 +1029,47 @@ function showAILoading(q) {
 
 function renderAIAnswer(q, answer) {
   document.getElementById('ai-question-label').textContent = q;
-  document.getElementById('ai-answer').textContent = answer;
+  document.getElementById('ai-answer').innerHTML = renderMarkdown(answer);
   document.getElementById('ai-panel').classList.add('visible');
   document.getElementById('ai-actions').style.display = 'flex';
+}
+
+// Renderiza un subconjunto seguro de Markdown a HTML. Escapa SIEMPRE el texto
+// antes de aplicar formato, así el contenido del modelo no puede inyectar HTML.
+function renderMarkdown(src) {
+  if (!src) return '';
+  const inline = (t) => escHtml(t)
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>')
+    .replace(/`([^`]+)`/g, '<code>$1</code>');
+
+  const lines = String(src).replace(/\r\n/g, '\n').split('\n');
+  let html = '', listType = null, para = [];
+  const closeList = () => { if (listType) { html += '</' + listType + '>'; listType = null; } };
+  const flushPara = () => { if (para.length) { html += '<p>' + para.join('<br>') + '</p>'; para = []; } };
+
+  for (const raw of lines) {
+    const line = raw.replace(/\s+$/, '');
+    if (!line.trim()) { flushPara(); closeList(); continue; }
+    let m;
+    if ((m = line.match(/^\s*#{1,4}\s+(.*)$/))) {
+      flushPara(); closeList();
+      html += '<h4 class="ai-h">' + inline(m[1]) + '</h4>';
+    } else if ((m = line.match(/^\s*[-*]\s+(.*)$/))) {
+      flushPara();
+      if (listType !== 'ul') { closeList(); html += '<ul>'; listType = 'ul'; }
+      html += '<li>' + inline(m[1]) + '</li>';
+    } else if ((m = line.match(/^\s*\d+[.)]\s+(.*)$/))) {
+      flushPara();
+      if (listType !== 'ol') { closeList(); html += '<ol>'; listType = 'ol'; }
+      html += '<li>' + inline(m[1]) + '</li>';
+    } else {
+      closeList();
+      para.push(inline(line.trim()));
+    }
+  }
+  flushPara(); closeList();
+  return html;
 }
 
 function hideAI() {

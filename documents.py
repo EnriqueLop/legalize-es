@@ -142,11 +142,47 @@ def _paragraphs(text: str) -> str:
     return "\n\n".join(latex_escape(b.strip()) for b in blocks if b.strip())
 
 
-def build_latex(doc_type: str, datos: dict, ai_sections: Optional[dict] = None) -> str:
+def _normativa_block(normativa: Optional[List[dict]]) -> str:
+    """Lista de normativa real encontrada en el índice, citada con su BOE.
+
+    Se incluye siempre que haya resultados, con independencia de lo que redacte
+    la IA: garantiza que el documento referencie legislación existente (no
+    inventada) relacionada con la materia.
+    """
+    if not normativa:
+        return ""
+    items: List[str] = []
+    for doc in normativa[:6]:
+        ident = (doc.get("identifier") or "").strip()
+        if not ident:
+            continue
+        title = (doc.get("title") or "Sin título").strip()
+        date = (doc.get("publication_date") or "").strip()
+        meta = ", ".join(filter(None, [ident, date]))
+        ref = f"{title} ({meta})" if meta else title
+        items.append("\\item " + latex_escape(ref))
+    if not items:
+        return ""
+    return (
+        "\\section*{NORMATIVA APLICABLE}\n"
+        "\\noindent A los efectos del presente escrito se considera de aplicación, "
+        "entre otra, la siguiente normativa publicada en el BOE:\n"
+        "\\begin{itemize}\n" + "\n".join(items) + "\n\\end{itemize}\n"
+    )
+
+
+def build_latex(
+    doc_type: str,
+    datos: dict,
+    ai_sections: Optional[dict] = None,
+    normativa: Optional[List[dict]] = None,
+) -> str:
     """Construye el documento LaTeX completo.
 
     `ai_sections` (opcional) puede traer claves `exposicion`, `fundamentos` y
     `solicitud` redactadas por la IA. Si no, se usa el texto literal del usuario.
+    `normativa` (opcional) es la lista de normas encontradas en el índice, que se
+    citan en una sección "Normativa aplicable".
     """
     cfg = DOC_TYPES[doc_type]
     e = latex_escape  # alias corto
@@ -198,6 +234,8 @@ def build_latex(doc_type: str, datos: dict, ai_sections: Optional[dict] = None) 
             "\\section*{FUNDAMENTOS DE DERECHO}\n" + fundamentos + "\n"
         )
 
+    normativa_block = _normativa_block(normativa)
+
     asunto_block = f"\\noindent\\textbf{{Asunto:}} {asunto}\\par\\medskip\n" if asunto else ""
 
     # XeLaTeX (recomendado) usa fontspec + polyglossia; UTF-8 y fuentes nativas.
@@ -240,7 +278,7 @@ def build_latex(doc_type: str, datos: dict, ai_sections: Optional[dict] = None) 
 \section*{{{e(cfg["verbo_expone"])}}}
 {exposicion}
 
-{fundamentos_block}
+{fundamentos_block}{normativa_block}
 \section*{{{e(cfg["verbo_solicita"])}}}
 {solicitud}
 
@@ -288,7 +326,7 @@ def compile_pdf(tex: str, workdir: Path) -> Optional[Path]:
 # ---------------------------------------------------------------------------
 
 async def draft_with_claude(doc_type: str, datos: dict, normativa: List[dict]) -> Optional[dict]:
-    """Pide al modelo (Anthropic o local) una redacción formal estructurada (JSON).
+    """Pide al modelo local una redacción formal estructurada (JSON).
 
     Devuelve un dict con claves `exposicion`, `fundamentos`, `solicitud`, o None
     si no hay backend de IA o falla la llamada.
@@ -311,20 +349,24 @@ async def draft_with_claude(doc_type: str, datos: dict, normativa: List[dict]) -
     system_prompt = (
         "Eres un jurista que redacta escritos administrativos en español, en "
         "estilo formal y respetuoso. Redactas en primera persona del interesado. "
-        "Cita identificadores BOE sólo cuando aporten fundamento real; no inventes "
-        "normas ni artículos. Devuelve EXCLUSIVAMENTE un objeto JSON válido con las "
-        "claves: exposicion, fundamentos, solicitud. Sin texto adicional ni markdown."
+        "Tu objetivo es dar el MÁXIMO peso jurídico a la solicitud, apoyándola en "
+        "la normativa aportada. Cita ÚNICAMENTE identificadores BOE que aparezcan "
+        "en la lista de normativa proporcionada; no inventes normas, artículos ni "
+        "referencias que no estén en esa lista. Devuelve EXCLUSIVAMENTE un objeto "
+        "JSON válido con las claves: exposicion, fundamentos, solicitud. Sin texto "
+        "adicional ni markdown."
     )
 
     user_message = (
         f"Tipo de documento: {cfg['label']}\n"
         f"Datos aportados por el ciudadano:\n{json.dumps(datos, ensure_ascii=False, indent=2)}\n\n"
-        f"Normativa potencialmente aplicable encontrada en la base de datos:\n{contexto}\n\n"
+        f"Normativa aplicable encontrada en la base de datos (cita SÓLO de aquí):\n{contexto}\n\n"
         "Redacta:\n"
         "- exposicion: los hechos/motivos de forma ordenada y formal.\n"
-        "- fundamentos: fundamentos jurídicos (cita BOE de la lista si procede; "
-        "si no hay base clara, deja una cadena vacía).\n"
-        "- solicitud: lo que se pide, de forma concreta.\n"
+        "- fundamentos: fundamentos jurídicos que refuercen la solicitud, citando "
+        "los identificadores BOE de la lista anterior que sean pertinentes. Sólo si "
+        "ninguna norma de la lista guarda relación con el asunto, deja una cadena vacía.\n"
+        "- solicitud: lo que se pide, de forma concreta y firme.\n"
         "Responde sólo con el JSON."
     )
 
@@ -353,22 +395,34 @@ async def draft_with_claude(doc_type: str, datos: dict, normativa: List[dict]) -
 # Orquestación
 # ---------------------------------------------------------------------------
 
-def generate(doc_type: str, datos: dict, ai_sections: Optional[dict]) -> dict:
+def generate(
+    doc_type: str,
+    datos: dict,
+    ai_sections: Optional[dict],
+    normativa: Optional[List[dict]] = None,
+) -> dict:
     """Construye el .tex, lo compila y lo guarda. Devuelve metadatos + token."""
     doc_id = uuid.uuid4().hex[:16]
     workdir = DOCS_DIR / doc_id
     workdir.mkdir(parents=True, exist_ok=True)
 
-    tex = build_latex(doc_type, datos, ai_sections)
+    tex = build_latex(doc_type, datos, ai_sections, normativa)
     (workdir / "documento.tex").write_text(tex, encoding="utf-8")
 
     pdf_path = compile_pdf(tex, workdir)
+
+    citada = [
+        {"identifier": d.get("identifier", ""), "title": d.get("title", "")}
+        for d in (normativa or [])[:6]
+        if d.get("identifier")
+    ]
 
     return {
         "doc_id": doc_id,
         "latex": tex,
         "pdf_available": pdf_path is not None,
         "used_ai": ai_sections is not None,
+        "normativa": citada,
     }
 
 

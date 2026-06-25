@@ -396,7 +396,7 @@ def api_status():
         "total_docs": len(_index) if ready else _index_loaded,
         "total_files": _index_total,
         "has_ai": llm.available(),
-        "ai_provider": llm.provider(),
+        "ai_provider": "local",
         "regions": REGIONS,
         "ranks": RANK_LABELS,
     }
@@ -506,13 +506,17 @@ async def api_generar(req: DocRequest):
             detail="Faltan campos obligatorios: " + ", ".join(faltan),
         )
 
+    # Buscamos la normativa relacionada con el asunto/hechos para (a) dar contexto
+    # a la IA y (b) citarla SIEMPRE en el documento como "Normativa aplicable",
+    # aunque la IA deje vacíos los fundamentos o esté desactivada.
+    query = req.context_query or req.datos.get("asunto") or req.datos.get("hechos", "")
+    normativa = search(query, limit=8) if _index_ready.is_set() and query else []
+
     ai_sections = None
     if req.use_ai and llm.available():
-        query = req.context_query or req.datos.get("asunto") or req.datos.get("hechos", "")
-        normativa = search(query, limit=8) if _index_ready.is_set() and query else []
         ai_sections = await documents.draft_with_claude(req.doc_type, req.datos, normativa)
 
-    result = documents.generate(req.doc_type, req.datos, ai_sections)
+    result = documents.generate(req.doc_type, req.datos, ai_sections, normativa)
     return result
 
 

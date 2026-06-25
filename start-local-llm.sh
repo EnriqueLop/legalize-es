@@ -21,9 +21,15 @@ fi
 
 # --device Vulkan1 = RX 7600 dedicada (Vulkan0 es la iGPU integrada del Ryzen).
 # -ngl 99  -> todas las capas a la GPU.  -c 8192 -> ventana de contexto.
-# --jinja  -> plantilla de chat (necesaria para el endpoint /v1/chat/completions).
+#
+# --skip-chat-parsing: clave para la estabilidad. Por defecto llama-server usa la
+# plantilla Jinja de Qwen2.5 con su parser de tool-calls "peg-native", que
+# devuelve HTTP 500 ("Failed to parse tool call arguments as JSON") cuando el
+# modelo emite JSON o respuestas largas cortadas por max_tokens. Con este flag se
+# fuerza un parser de contenido puro: la respuesta llega tal cual en
+# message.content (no necesitamos tool-calls), sin ese fallo intermitente.
 exec "$LLAMA_DIR/llama-server" \
   -hf bartowski/Qwen2.5-7B-Instruct-GGUF:Q4_K_M \
   --device Vulkan1 \
   --host 127.0.0.1 --port 8080 \
-  -ngl 99 -c 8192 --jinja
+  -ngl 99 -c 8192 --jinja --skip-chat-parsing
