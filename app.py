@@ -6,17 +6,17 @@ búsqueda y consulta con IA (Claude).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
 import threading
-import time
 from pathlib import Path
 from typing import List, Optional
 
 import yaml
 from fastapi import FastAPI, Query, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -27,7 +27,8 @@ import llm
 # Constantes
 # ---------------------------------------------------------------------------
 
-REPO_PATH = Path(__file__).parent
+REPO_PATH     = Path(__file__).parent
+SEMANTIC_POOL = 60   # candidatos keyword que se re-ordenan semánticamente
 INDEX_CACHE = Path("/tmp/legalize_index.json")
 MAX_RESULTS = 30
 PREVIEW_CHARS = 400
@@ -316,7 +317,47 @@ def search(
 
 
 # ---------------------------------------------------------------------------
-# Consulta con Claude
+# Búsqueda semántica (HuggingFace Embeddings)
+# ---------------------------------------------------------------------------
+
+def _cosine_sim(a: list, b: list) -> float:
+    try:
+        import numpy as np
+        va, vb = np.array(a, dtype=float), np.array(b, dtype=float)
+        d = np.linalg.norm(va) * np.linalg.norm(vb)
+        return float(np.dot(va, vb) / d) if d > 1e-8 else 0.0
+    except ImportError:
+        dot  = sum(x * y for x, y in zip(a, b))
+        na   = sum(x * x for x in a) ** 0.5
+        nb   = sum(x * x for x in b) ** 0.5
+        return dot / (na * nb) if na * nb > 1e-8 else 0.0
+
+
+async def semantic_rerank(query: str, candidates: List[dict]) -> List[dict]:
+    """Re-ordena candidatos por similitud semántica usando embeddings de HuggingFace."""
+    if not candidates or not llm.HF_TOKEN:
+        return candidates
+
+    doc_texts = [
+        f"{d.get('title', '')} | {' '.join((d.get('subjects') or [])[:6])}"
+        for d in candidates
+    ]
+    all_texts = [query] + doc_texts
+
+    loop = asyncio.get_event_loop()
+    all_embs = await loop.run_in_executor(None, llm.embed_texts, all_texts)
+    if not all_embs:
+        return candidates
+
+    query_emb = all_embs[0]
+    scored = [(  _cosine_sim(query_emb, emb), doc)
+              for emb, doc in zip(all_embs[1:], candidates)]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [doc for _, doc in scored]
+
+
+# ---------------------------------------------------------------------------
+# Consulta con el proveedor de IA activo
 # ---------------------------------------------------------------------------
 
 async def ask_claude(question: str, docs: List[dict]) -> str | None:
@@ -371,9 +412,10 @@ app.mount("/static", StaticFiles(directory=str(REPO_PATH / "static")), name="sta
 
 class QueryRequest(BaseModel):
     question: str
-    region: Optional[str] = None
-    rank: Optional[str] = None
-    status: Optional[str] = None
+    region:   Optional[str] = None
+    rank:     Optional[str] = None
+    status:   Optional[str] = None
+    semantic: bool = False
 
 
 class DocRequest(BaseModel):
@@ -391,55 +433,69 @@ def root():
 @app.get("/api/status")
 def api_status():
     ready = _index_ready.is_set()
+    prov  = llm.provider()
     return {
-        "ready": ready,
-        "total_docs": len(_index) if ready else _index_loaded,
-        "total_files": _index_total,
-        "has_ai": llm.available(),
-        "ai_provider": "local",
-        "regions": REGIONS,
-        "ranks": RANK_LABELS,
+        "ready":        ready,
+        "total_docs":   len(_index) if ready else _index_loaded,
+        "total_files":  _index_total,
+        "has_ai":       llm.available(),
+        "ai_provider":  prov,
+        "ai_model":     llm.active_model(),
+        "has_semantic": bool(llm.HF_TOKEN),
+        "embed_model":  llm.HF_EMBED_MODEL if llm.HF_TOKEN else "",
+        "regions":      REGIONS,
+        "ranks":        RANK_LABELS,
     }
 
 
 @app.get("/api/search")
-def api_search(
-    q: str = Query(..., min_length=2),
-    region: Optional[str] = None,
-    rank: Optional[str] = None,
-    status: Optional[str] = None,
-    limit: int = Query(default=20, le=50),
+async def api_search(
+    q:        str           = Query(..., min_length=2),
+    region:   Optional[str] = None,
+    rank:     Optional[str] = None,
+    status:   Optional[str] = None,
+    limit:    int           = Query(default=20, le=50),
+    semantic: bool          = False,
 ):
     if not _index_ready.is_set():
-        raise HTTPException(status_code=503, detail="Índice en construcción, espera unos segundos.")
+        raise HTTPException(503, "Índice en construcción, espera unos segundos.")
 
-    results = search(q, region=region, rank_filter=rank, status_filter=status, limit=limit)
+    pool = SEMANTIC_POOL if (semantic and llm.HF_TOKEN) else limit
+    docs = search(q, region=region, rank_filter=rank, status_filter=status, limit=pool)
+
+    if semantic and llm.HF_TOKEN and docs:
+        docs = await semantic_rerank(q, docs)
+        docs = docs[:limit]
+
     return {
-        "query": q,
-        "total": len(results),
-        "results": [_serialise(d) for d in results],
+        "query":    q,
+        "total":    len(docs),
+        "semantic": semantic and bool(llm.HF_TOKEN),
+        "results":  [_serialise(d) for d in docs],
     }
 
 
 @app.post("/api/ask")
 async def api_ask(req: QueryRequest):
     if not _index_ready.is_set():
-        raise HTTPException(status_code=503, detail="Índice en construcción, espera unos segundos.")
+        raise HTTPException(503, "Índice en construcción, espera unos segundos.")
 
-    results = search(
-        req.question,
-        region=req.region,
-        rank_filter=req.rank,
-        status_filter=req.status,
-        limit=10,
-    )
+    pool = SEMANTIC_POOL if llm.HF_TOKEN else 10
+    docs = search(req.question, region=req.region,
+                  rank_filter=req.rank, status_filter=req.status, limit=pool)
 
-    ai_answer = await ask_claude(req.question, results)
+    if llm.HF_TOKEN and docs:
+        docs = await semantic_rerank(req.question, docs)
+
+    ai_answer = await ask_claude(req.question, docs[:8])
 
     return {
-        "question": req.question,
-        "ai_answer": ai_answer,
-        "sources": [_serialise(d) for d in results[:8]],
+        "question":    req.question,
+        "ai_answer":   ai_answer,
+        "ai_provider": llm.provider(),
+        "ai_model":    llm.active_model(),
+        "semantic":    bool(llm.HF_TOKEN),
+        "sources":     [_serialise(d) for d in docs[:8]],
     }
 
 

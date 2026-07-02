@@ -80,6 +80,15 @@
     }
     #status-badge.ready { background: rgba(22,163,74,.3); }
     #status-badge.loading { background: rgba(255,196,0,.3); color: var(--yellow); }
+    .ai-badge {
+      font-size: .7rem; padding: 3px 9px;
+      border-radius: 20px; white-space: nowrap; font-weight: 600; display: none;
+    }
+    .ai-badge.local     { background: rgba(22,163,74,.35); color: #86efac; }
+    .ai-badge.hf        { background: rgba(255,107,53,.35); color: #fdb894; }
+    .ai-badge.anthropic { background: rgba(124,58,237,.35); color: #c4b5fd; }
+    .sem-badge { font-size: .73rem; padding: 2px 8px; background: #fff3ee;
+      color: #ea580c; border-radius: 20px; font-weight: 600; }
 
     /* Search bar */
     .search-bar {
@@ -596,6 +605,7 @@
       <h1>Consultor Legislativo España</h1>
       <p>Base de datos BOE · Legislación nacional y autonómica</p>
     </div>
+    <span id="ai-badge" class="ai-badge"></span>
     <div id="status-badge" class="loading">Cargando índice…</div>
   </div>
 
@@ -631,6 +641,9 @@
       <span class="status-dot in_force"></span>
       Solo vigentes
     </span>
+    <span class="filter-tag" id="f-semantic" title="Re-ordena usando embeddings HuggingFace" style="display:none">
+      🔬 Semántica
+    </span>
     <button class="clear-btn" id="clear-btn">Limpiar filtros</button>
     <button class="btn-outline" id="gen-doc-btn-top" type="button" style="margin-left:auto;padding:6px 14px;font-size:.82rem;">📄 Generar documento</button>
   </div>
@@ -646,7 +659,9 @@
         </svg>
       </div>
       <div>
-        <h3>Respuesta del Asistente Jurídico</h3>
+        <h3>Respuesta del Asistente Jurídico
+          <span id="sem-badge-ai" class="sem-badge" style="display:none;margin-left:8px">🔬 Semántica</span>
+        </h3>
         <div class="ai-q" id="ai-question-label"></div>
       </div>
     </div>
@@ -702,12 +717,16 @@
 // -------------------------------------------------------------------
 // State
 // -------------------------------------------------------------------
-let appReady = false;
-let hasAI = false;
-let allRegions = {};
-let allRanks = {};
-let debounceTimer = null;
-let filterStatus = false;
+let appReady       = false;
+let hasAI          = false;
+let aiProvider     = 'none';
+let aiModel        = '';
+let hasSemantic    = false;
+let filterSemantic = false;
+let allRegions     = {};
+let allRanks       = {};
+let debounceTimer  = null;
+let filterStatus   = false;
 
 const SUGGESTIONS = [
   "¿Cómo tributan las ayudas DANA?",
@@ -735,10 +754,13 @@ async function pollStatus() {
   try {
     const res = await fetch('/api/status');
     const data = await res.json();
-    appReady = data.ready;
-    hasAI = data.has_ai;
-    allRegions = data.regions || {};
-    allRanks = data.ranks || {};
+    appReady    = data.ready;
+    hasAI       = data.has_ai;
+    aiProvider  = data.ai_provider  || 'none';
+    aiModel     = data.ai_model     || '';
+    hasSemantic = data.has_semantic || false;
+    allRegions  = data.regions      || {};
+    allRanks    = data.ranks        || {};
     updateStatusBadge(data);
     if (!appReady) {
       setTimeout(pollStatus, 1500);
@@ -761,6 +783,19 @@ function updateStatusBadge(data) {
     badge.className = 'loading';
     setTimeout(pollStatus, 1200);
   }
+  // AI provider badge
+  const ab = document.getElementById('ai-badge');
+  if (data.ai_provider === 'local') {
+    ab.textContent = '🖥️ IA local'; ab.className = 'ai-badge local'; ab.style.display = '';
+  } else if (data.ai_provider === 'huggingface') {
+    ab.textContent = '🤗 HuggingFace'; ab.className = 'ai-badge hf'; ab.style.display = '';
+  } else if (data.ai_provider === 'anthropic') {
+    ab.textContent = '✦ Claude'; ab.className = 'ai-badge anthropic'; ab.style.display = '';
+  } else {
+    ab.style.display = 'none';
+  }
+  // Semantic toggle visibility
+  document.getElementById('f-semantic').style.display = data.has_semantic ? '' : 'none';
 }
 
 function populateFilters() {
@@ -835,6 +870,12 @@ function bindEvents() {
     document.getElementById('f-status').classList.toggle('active', filterStatus);
     triggerSearch();
   });
+  document.getElementById('f-semantic').addEventListener('click', () => {
+    if (!hasSemantic) return;
+    filterSemantic = !filterSemantic;
+    document.getElementById('f-semantic').classList.toggle('active', filterSemantic);
+    triggerSearch();
+  });
   document.getElementById('clear-btn').addEventListener('click', clearFilters);
 
   document.getElementById('modal-overlay').addEventListener('click', e => {
@@ -858,8 +899,10 @@ function bindEvents() {
 function clearFilters() {
   document.getElementById('f-region').value = '';
   document.getElementById('f-rank').value = '';
-  filterStatus = false;
+  filterStatus   = false;
+  filterSemantic = false;
   document.getElementById('f-status').classList.remove('active');
+  document.getElementById('f-semantic').classList.remove('active');
   triggerSearch();
 }
 
@@ -901,6 +944,7 @@ async function triggerAsk() {
     region: document.getElementById('f-region').value || null,
     rank: document.getElementById('f-rank').value || null,
     status: filterStatus ? 'in_force' : null,
+    semantic: filterSemantic || hasSemantic,
   };
 
   try {
@@ -912,7 +956,7 @@ async function triggerAsk() {
     const data = await res.json();
 
     if (data.ai_answer) {
-      renderAIAnswer(q, data.ai_answer);
+      renderAIAnswer(q, data.ai_answer, data.semantic);
     } else {
       hideAI();
     }
@@ -930,6 +974,7 @@ function buildParams(q) {
   if (region) p.set('region', region);
   if (rank) p.set('rank', rank);
   if (filterStatus) p.set('status', 'in_force');
+  if (filterSemantic) p.set('semantic', 'true');
   return p.toString();
 }
 
@@ -1027,11 +1072,13 @@ function showAILoading(q) {
   panel.classList.add('visible');
 }
 
-function renderAIAnswer(q, answer) {
+function renderAIAnswer(q, answer, semantic) {
   document.getElementById('ai-question-label').textContent = q;
   document.getElementById('ai-answer').innerHTML = renderMarkdown(answer);
   document.getElementById('ai-panel').classList.add('visible');
   document.getElementById('ai-actions').style.display = 'flex';
+  const sb = document.getElementById('sem-badge-ai');
+  if (sb) sb.style.display = semantic ? '' : 'none';
 }
 
 // Renderiza un subconjunto seguro de Markdown a HTML. Escapa SIEMPRE el texto
